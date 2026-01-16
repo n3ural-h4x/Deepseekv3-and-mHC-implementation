@@ -1,9 +1,15 @@
-#IMPLEMENTATION OF THE DEEPSEEK mHC:
+#IMPLEMENTATION OF THE DEEPSEEK mHC and v3:
 import torch
 import torch.nn.functional as F 
 import torch.nn as nn
 
-
+class RMSnorm(nn.Module):
+  def __init__(self, eps=1e-6):
+    super().__init__()
+    self.eps = eps
+  def forward(self, x:torch.Tensor):
+    return x / torch.sqrt(torch.mean(torch.square(x), dim=-1, keepdim=True) + self.eps) #keep the last dim
+  
 class Rope(nn.Module):
     def __init__(self, seq_len:int, d_model:int, theta=10000):
      super().__init__()
@@ -57,17 +63,19 @@ class MLA(nn.Module):
     #todo use repeat interleave since kr has only 1 head dimension
     K = torch.cat([K_C, k_r], dim=-1)
     V = self.W_uv(C_dkv).view(b, seq_len, self.n_heads, self.d_head).transpose(1, 2)
-
-    
-    
+    # for Q query vector
     c_Q = self.W_dq(x)
     q_c = self.W_uq(c_Q).view(b, seq_len, self.n_heads, self.d_head).transpose(1, 2)
     c_Q = self.W_qr(c_Q).view(b, seq_len, self.n_heads, self.d_head).transpose(1, 2)
     #TODO FOR THE Q_R YOU HAVE TO CHANGE THE SPECIFIC DIM
+    #DONE
     Q_r = self.rope(head_dimension, c_Q)
     Q = torch.cat([Q_r, q_c], dim=-1)
 
-    #attn_matrix  = Q.tranpose(-1, -2) @ K / 
+    # Computation 
+    attn_matrix  = Q @ K.transpose(-1, -2) / torch.sqrt()
+
+    causal_mask  = torch.ones_like(attn_matrix) 
 
 class SwigluFFN(nn.Module):
   def __init__(self, d_model:int, d_ff:int):
@@ -81,22 +89,56 @@ class SwigluFFN(nn.Module):
     return self.down_gate(self.activation(self.up_gate(x)) * self.gate(x))
 
 class Router(nn.Module):
-  def __init__(self, top_k:int, n_experts:int, d_model:int):
+  def __init__(self, top_k:int, n_experts:int, d_model:int, n_groups:int, bias:bool, top_k_groups:int):
     super().__init__()
     self.top_k = top_k
+    self.top_k_groups = top_k_groups
     self.n_experts = n_experts
     self.router = nn.Linear(d_model, n_experts)
+    self.n_groups = n_groups
+    self.bias = torch.empty(n_experts) if bias else None
 
   def forward(self, x:torch.Tensor):
-    batch, seq_len, d_model = x.size()
+    #batch, seq_len, d_model = x.size()
     x_routed = self.router(x)
     x_flat = x_routed(-1, self.n_experts)
     x_flat = x_flat.sigmoid()
-    top_k_weight, top_k_idx = torch.top_k(x_flat, dim=-1, k=self.top_k)
-    router_weight = torch.empty
+    og_scores = x_flat
+    x_flat += self.bias #Bias term for way around balance loss
+    #top_k_weight, top_k_idx = torch.top_k(x_flat, dim=-1, k=self.top_k)
+    if self.n_groups > 1:
+      x_flat = x_flat.view(x_flat.size(0), self.n_groups, -1) # MAKE IT VIEW INTO GRPS
+      if self.bias is None:
+        grp_scores = x_flat.amax(dim=-1)
+      else:
+        grp_scores = x_flat.topk(2, dim=-1)[0].sum(dim=-1) #WHY DOES THEY USE TOP_K = 2 IDK WILL HAVE TO LOOK MORE INTO IT
+      _, grp_idx = grp_scores.topk(self.topk_groups, dim=-1) # Now take the highest idx from the weight scores
+      mask = x_flat.new_ones(x_flat.size(0), self.n_groups).scatter_(grp_idx, dim=-1)
+      scores = x_flat.masked_fill_(mask[:, None], float(-'inf')).flatten(1)
 
+    indices = torch.topk(scores, self.top_k, dim=-1)[1]
+    weights = og_scores.gather(1, indices)
+    weights *= self.route_scale
+    return weights, indices
 
-
+class MoE(nn.Module):
+  def __init__(self,top_k, n_experts, d_model, n_group, bias, top_k_groups, d_ff):
+    super().__init__()
+    self.d_model = d_model
+    self.router = Router(top_k, n_experts, d_model, n_group, bias, top_k_groups)
+    self.experts = nn.Modulelist([SwigluFFN(d_model, d_ff) for _ in range(n_experts)])
+    #self.shared_experts = SwigluFFN(d_model, args.n_shared_experts * args.moe_inter_dim)
+  def forward(self, x:torch.Tensor):
+    weights, idx = self.router(x)
+    y = torch.zeros_like(x.view(-1, self.d_model))
+    total_count = torch.bincount(idx.view(-1), self.n_experts).to_list()
+    for i in range(self.n_experts):
+      if total_count[i] == 0:
+        continue
+      expert = self.experts[i]
+      indicies, top = torch.where(idx == i) #gives the x,y coordinates
+      y[indicies] += expert(x[indicies]) * weights[indicies, top, None]
+      
 
 
 
