@@ -16,7 +16,7 @@ class Rope(nn.Module):
      self.length = torch.arange(0, seq_len).float()[:, None]
      self.dim = torch.pow(theta, torch.arange(0, d_model, 2).float() / d_model)[None, :]     
      self.matrix = torch.mul(self.length, 1.0 / self.dim)
-     self.register_buffer('matrix', self.matrix)
+     self.register_buffer('matrix', self.length * 1.0 / self.dim, persistent=False)
 
     def calculate(self):
      self.cos = torch.cos(self.matrix)
@@ -28,7 +28,7 @@ class Rope(nn.Module):
       x1, x2 = x[..., :dim//2], x[..., dim//2:]
       head_dimension = head_dimension[:seq_len, :]
       head_dimension = head_dimension[None, None, :, :]
-      x_cos, x_sin = torch.split(head_dimension, 2,  dim=-1)
+      x_cos, x_sin = torch.split(head_dimension,  dim=-1)
       x_even = x1 * x_cos - x2 * x_sin
       x_odd= x1 * x_sin + x2 * x_cos
       return torch.cat([x_even, x_odd], dim=-1)
@@ -122,12 +122,14 @@ class Router(nn.Module):
     return weights, indices
 
 class MoE(nn.Module):
-  def __init__(self,top_k, n_experts, d_model, n_group, bias, top_k_groups, d_ff):
+  def __init__(self,top_k, n_experts, d_model, n_group, bias, top_k_groups, d_ff, shared_experts):
     super().__init__()
     self.d_model = d_model
     self.router = Router(top_k, n_experts, d_model, n_group, bias, top_k_groups)
     self.experts = nn.Modulelist([SwigluFFN(d_model, d_ff) for _ in range(n_experts)])
-    #self.shared_experts = SwigluFFN(d_model, args.n_shared_experts * args.moe_inter_dim)
+    self.shared_experts = shared_experts
+    self.d_ff = d_ff
+    self.shared_experts = SwigluFFN(d_model, self.shared_experts*d_ff)
   def forward(self, x:torch.Tensor):
     weights, idx = self.router(x)
     y = torch.zeros_like(x.view(-1, self.d_model))
@@ -137,8 +139,34 @@ class MoE(nn.Module):
         continue
       expert = self.experts[i]
       indicies, top = torch.where(idx == i) #gives the x,y coordinates
-      y[indicies] += expert(x[indicies]) * weights[indicies, top, None]
-      
+      y[indicies] += expert(x[indicies]) * weights[indicies, top, None] # take the indices which will have the following experts and add the weights to it
+    z = self.shared_experts(x)
+    return (z+y).view_as(x)
+  
+class TransformerBlock(nn.Module):
+  def __init__(self,use_moe:bool):
+    super().__init__()
+    self.use_moe = use_moe
+    self.rms1 = RMSnorm()
+    self.rms2 = RMSnorm()
+    self.mla = MLA()
+    self.ffn = MoE() if self.use_moe else SwigluFFN()
+  def forward(self, x:torch.Tensor):
+    x = x + self.mla(self.rms1(x))
+    x = x + self.ffn(self.rms2(x))
+    return x
+  
+class DeepSeekv3(nn.Module):
+  def __init__(self,layers:int ):
+    super().__init__()
+    self.layers = layers
+    self.layers = nn.Modulelist([TransformerBlock() for _ in range(self.layers)])
+    self.lm_head = nn.Linear(d_model, num_of_tokens)
+    self.embedding = nn.embedding
+  
+  def forward(self, x:torch.Tensor):
+    @torch.no_grad():
+    @torch.no_grad
 
 
 
